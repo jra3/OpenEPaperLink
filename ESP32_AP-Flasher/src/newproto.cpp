@@ -1,4 +1,5 @@
 #include "newproto.h"
+#include "cloudsync.h"
 
 #include <Arduino.h>
 #include <FS.h>
@@ -769,6 +770,8 @@ void processDataReq(struct espAvailDataReq* eadr, bool local, IPAddress remoteIP
             }
         }
     }
+
+    if (local && eadr->adr.lastPacketRSSI != 0) cloudsyncEvent(eadr->src, eadr->adr, now);
 
     if (local) {
         wsSendTaginfo(eadr->src, SYNC_TAGSTATUS);

@@ -1,4 +1,5 @@
 #include "contentmanager.h"
+#include "cloudsync.h"
 
 #include <map>
 
@@ -346,6 +347,7 @@ void drawNew(const uint8_t mac[8], tagRecord *&taginfo) {
         case 23:  // Static image (advanced)
         case 24:  // External image
         case 25:  // Home Assistant
+        case CONTENTMODE_CLOUD:
         {
             String configFilename = cfgobj["filename"].as<String>();
             if (!util::isEmptyOrNull(configFilename)) {

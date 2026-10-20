@@ -7,6 +7,7 @@
 #include <ETH.h>
 #endif
 
+#include "cloudsync.h"
 #include "contentmanager.h"
 #include "flasher.h"
 #include "serialap.h"
@@ -155,6 +156,7 @@ void setup() {
     }
     xTaskCreate(APTask, "AP Process", 6000, NULL, 5, NULL);
     vTaskDelay(10 / portTICK_PERIOD_MS);
+    xTaskCreate(cloudsyncTask, "cloudsync", 12000, NULL, 2, NULL);
 
 #ifdef HAS_TFT
     // Checkin + touch run in their own task so they keep working even when the
