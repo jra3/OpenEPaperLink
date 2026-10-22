@@ -82,6 +82,16 @@ void contentRunner() {
     for (tagRecord *taginfo : tagDBSnapshot()) {
 
         const bool isAp = memcmp(taginfo->mac, wifimac, 8) == 0;
+#ifndef HAS_TFT
+        // no screen: a record for the AP's own display (e.g. kept in tagDB across an OTA from a TFT build)
+        // would render forever into transfers nobody can receive
+        if (isAp) {
+            wsSendTaginfo(taginfo->mac, SYNC_DELETE);
+            dequeueAllItems(taginfo->mac);
+            deleteRecord(taginfo->mac);
+            continue;
+        }
+#endif
         const bool due = now >= taginfo->nextupdate || needRedraw(taginfo->contentMode, taginfo->wakeupReason);
         const bool checkinSoon = taginfo->expectedNextCheckin < now + 300 || isAp || (wsClientCount() && config.stopsleep == 1);
         if (taginfo->RSSI && due && config.runStatus == RUNSTATUS_RUN && checkinSoon && spaceLeft() &&
