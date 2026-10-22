@@ -9,8 +9,9 @@
 // takes the manifest's "name" (its tank) as its alias. The AP's web UI cannot
 // change such a tag.
 //
-// Events: POST {url}/v1/ap/{ap}/events {"events":[...]}; the reply carries the
-// manifest when it changed.
+// Events: POST {url}/v1/ap/{ap}/events {"events":[...],"ap":{...}}; the reply carries the
+// manifest when it changed. "ap" is this AP's health (firmware, uptime, heap, Wi-Fi RSSI, events
+// dropped); a batch goes at least every STATUS_MS, empty if no tag checked in, so the cloud sees it.
 //
 // Claiming: an AP without a token registers with POST {url}/v1/claim and saves the token it gets.
 // The cloud answers 403 with a claim code until someone enters that code in the web app; the code
@@ -31,6 +32,12 @@
 #include "tag_db.h"
 #include "web.h"
 
+#ifndef SHA
+#define SHA 0
+#endif
+#define STR_IMPL(x) #x
+#define STR(x) STR_IMPL(x)
+
 struct CloudEvent {
     uint8_t mac[8];
     uint32_t t;
@@ -47,6 +54,7 @@ static QueueHandle_t eventQueue = xQueueCreate(64, sizeof(CloudEvent));
 static constexpr uint32_t EVENT_FLUSH_MS = 30000;  // check-ins wait at most this long; presses go at once
 static constexpr uint32_t RETRY_MS = 30000;
 static constexpr uint32_t UNCLAIMED_POLL_S = 10;
+static constexpr uint32_t STATUS_MS = 300000;  // the longest the cloud goes without hearing the AP's health
 static const char* DEFAULT_URL = "https://fishtags.net";
 
 // for GET /cloud, which the web server reads from its own task
@@ -54,6 +62,10 @@ static SemaphoreHandle_t statusMutex = xSemaphoreCreateMutex();
 static String cloudState = "starting";
 static String cloudClaimCode;
 static String cloudApId;
+static String cloudUrl;
+static time_t cloudLastContact = 0;  // last 2xx/304 from the cloud
+static uint32_t cloudPollSeconds = 0;
+static uint32_t eventsDropped = 0;  // since boot, when the queue was full
 
 template <typename F>
 static void withStatus(F f) {
@@ -88,6 +100,7 @@ void cloudsyncEvent(const uint8_t mac[8], const struct AvailDataReq& adr, uint32
         CloudEvent dropped;
         xQueueReceive(eventQueue, &dropped, 0);
         xQueueSend(eventQueue, &e, 0);
+        withStatus([&] { eventsDropped++; });
     }
 }
 
@@ -96,11 +109,34 @@ String cloudsyncStatus() {
     withStatus([&] {
         doc["state"] = cloudState;
         doc["ap"] = cloudApId;
+        doc["url"] = cloudUrl;
         if (cloudClaimCode.length()) doc["claim_code"] = cloudClaimCode;
+        if (cloudLastContact) doc["last_contact"] = cloudLastContact;
+        if (cloudPollSeconds) doc["poll_s"] = cloudPollSeconds;
+        doc["dropped"] = eventsDropped;
     });
+    doc["queued"] = uxQueueMessagesWaiting(eventQueue);
     String out;
     serializeJson(doc, out);
     return out;
+}
+
+String cloudsyncClaimLink() {
+    String link;
+    withStatus([&] {
+        if (cloudClaimCode.length() && cloudUrl.length()) link = cloudUrl + "/aps?code=" + cloudClaimCode;
+    });
+    return link;
+}
+
+static void noteContact() {
+    time_t now;
+    time(&now);
+    withStatus([&] {
+        cloudState = "ok";
+        cloudClaimCode = "";
+        cloudLastContact = now;
+    });
 }
 
 // /cloud.json: {"url":..., "ap":..., "token":...}. Missing or partial means "register with url".
@@ -276,6 +312,12 @@ static bool applyManifest(WiFiClientSecure& client, const CloudConfig& cfg, Json
 static int postEvents(WiFiClientSecure& client, const CloudConfig& cfg, std::vector<CloudEvent>& batch, String& etag, JsonDocument& reply) {
     JsonDocument doc;
     JsonArray events = doc["events"].to<JsonArray>();
+    JsonObject ap = doc["ap"].to<JsonObject>();
+    ap["fw"] = STR(SHA);
+    ap["uptime"] = (uint32_t)(esp_timer_get_time() / 1000000);
+    ap["heap"] = ESP.getFreeHeap();
+    ap["rssi"] = WiFi.RSSI();
+    withStatus([&] { ap["dropped"] = eventsDropped; });
     char hexmac[17];
     for (const CloudEvent& e : batch) {
         JsonObject o = events.add<JsonObject>();
@@ -335,13 +377,18 @@ void cloudsyncTask(void* parameter) {
     uint32_t pollSeconds = 60;
     uint32_t nextPoll = 0;
     uint32_t nextFlush = 0;
+    uint32_t lastPost = millis() - STATUS_MS;  // report health on the first contact
     std::vector<CloudEvent> batch;
 
     while (true) {
         vTaskDelay(1000 / portTICK_PERIOD_MS);
         if (config.runStatus == RUNSTATUS_STOP || WiFi.status() != WL_CONNECTED) continue;
         loadConfig(cfg);
-        withStatus([&] { cloudApId = cfg.ap; });
+        withStatus([&] {
+            cloudApId = cfg.ap;
+            cloudUrl = cfg.url;
+            cloudPollSeconds = pollSeconds;
+        });
         if (!cfg.url.startsWith("https://")) {
             withStatus([&] { cloudState = "bad url in /cloud.json"; });
             vTaskDelay(30000 / portTICK_PERIOD_MS);
@@ -363,19 +410,23 @@ void cloudsyncTask(void* parameter) {
 
         JsonDocument manifest;
         bool haveManifest = false;
-        if (!batch.empty() && (press || batch.size() >= 32 || (int32_t)(millis() - nextFlush) >= 0)) {
+        const bool flush = !batch.empty() && (press || batch.size() >= 32 || (int32_t)(millis() - nextFlush) >= 0);
+        const bool heartbeat = batch.empty() && millis() - lastPost >= STATUS_MS && (int32_t)(millis() - nextPoll) >= 0;
+        if (flush || heartbeat) {
             JsonDocument reply;
             const int code = postEvents(client, cfg, batch, etag, reply);
+            lastPost = millis();
             if (code == 200) {
-                withStatus([&] { cloudState = "ok"; });
-                withStatus([&] { cloudClaimCode = ""; });
+                noteContact();
                 batch.clear();
+                nextPoll = millis() + pollSeconds * 1000;  // the reply carries any manifest change
                 if (reply["manifest"].is<JsonObject>()) {
                     manifest.set(reply["manifest"]);
                     haveManifest = true;
                 }
             } else if (code == 403) {
                 batch.clear();  // nobody to log them for yet
+                nextPoll = millis() + UNCLAIMED_POLL_S * 1000;
             } else {
                 withStatus([&] { cloudState = "events http " + String(code); });
                 logLineRateLimited("cloudevents", "cloud: events http " + String(code), 600);
@@ -385,8 +436,7 @@ void cloudsyncTask(void* parameter) {
             const int code = getManifest(client, cfg, etag, manifest);
             haveManifest = code == 200;
             if (code == 200 || code == 304) {
-                withStatus([&] { cloudState = "ok"; });
-                withStatus([&] { cloudClaimCode = ""; });
+                noteContact();
             } else if (code != 403) {
                 withStatus([&] { cloudState = "manifest http " + String(code); });
                 logLineRateLimited("cloudmanifest", "cloud: manifest http " + String(code), 600);

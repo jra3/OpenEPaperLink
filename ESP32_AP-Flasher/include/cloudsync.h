@@ -13,8 +13,12 @@
 // AP registers with the default cloud and waits to be claimed.
 void cloudsyncTask(void* parameter);
 
-// {"state":..., "ap":..., "claim_code":...} for GET /cloud
+// GET /cloud: {"state", "ap", "url", "claim_code" (while unclaimed), "last_contact" (unix time),
+// "poll_s", "queued" (check-ins waiting), "dropped" (check-ins lost since boot)}
 String cloudsyncStatus();
+
+// Where to claim this AP: "{url}/aps?code=XXXX-XXXX" while it waits to be claimed, else empty
+String cloudsyncClaimLink();
 
 // Queue a tag check-in for the cloud. Called from processDataReq, never blocks.
 void cloudsyncEvent(const uint8_t mac[8], const struct AvailDataReq& adr, uint32_t now);
