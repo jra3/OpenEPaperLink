@@ -16,9 +16,11 @@
 
 #include "AsyncJson.h"
 #include "LittleFS.h"
+#include "QRCodeGenerator.h"
 #include "SPIFFSEditor.h"
 #include "ble_writer.h"
 #include "commstructs.h"
+#include "fishtags_ui.h"
 #include "language.h"
 #include "leds.h"
 #include "newproto.h"
@@ -45,6 +47,45 @@ static bool cloudManaged(const uint8_t mac[8]) {
     TagDBLock lock;
     const tagRecord *taginfo = tagRecord::findByMAC(mac);
     return taginfo != nullptr && taginfo->contentMode == CONTENTMODE_CLOUD;
+}
+
+// The upstream OpenEPaperLink UI lives at /oepl/. Its pages use relative URLs ("main.js", "get_db", and
+// location.pathname + "ws"), so serving /oepl/<x> as /<x> keeps every one of them working.
+class OeplRewrite : public AsyncWebRewrite {
+   public:
+    OeplRewrite() : AsyncWebRewrite("/oepl/", "/") {}
+    bool match(AsyncWebServerRequest *request) override {
+        if (!request->url().startsWith("/oepl/")) return false;
+        _toUrl = request->url().substring(5);
+        if (_toUrl == "/") _toUrl = "/index.html";
+        return true;
+    }
+};
+
+// The claim link as a QR code, so a phone can open the claim page straight off the AP's own page
+static void sendClaimQr(AsyncWebServerRequest *request) {
+    const String link = cloudsyncClaimLink();
+    if (!link.length()) {
+        request->send(404, "text/plain", "Not waiting to be claimed");
+        return;
+    }
+    const uint8_t version = findFittingVersion_text(ECC_MEDIUM, link.c_str());
+    QRCode qrcode;
+    uint8_t modules[qrcode_getBufferSize(version)];
+    qrcode_initText(&qrcode, modules, version, ECC_MEDIUM, link.c_str());
+    const int quiet = 4;
+    const int size = qrcode.size + 2 * quiet;
+    String svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 " + String(size) + " " + String(size) +
+                 "\" shape-rendering=\"crispEdges\"><rect width=\"100%\" height=\"100%\" fill=\"#fff\"/><path fill=\"#000\" d=\"";
+    for (uint8_t y = 0; y < qrcode.size; y++) {
+        for (uint8_t x = 0; x < qrcode.size; x++) {
+            if (qrcode_getModule(&qrcode, x, y)) svg += "M" + String(x + quiet) + " " + String(y + quiet) + "h1v1h-1z";
+        }
+    }
+    svg += "\"/></svg>";
+    AsyncWebServerResponse *response = request->beginResponse(200, "image/svg+xml", svg);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
 }
 
 AsyncWebServer server(80);
@@ -917,6 +958,7 @@ void init_web() {
     // OTA related calls
 
     server.on("/sysinfo", HTTP_GET, handleSysinfoRequest);
+    server.on("/cloud_qr.svg", HTTP_GET, sendClaimQr);
     server.on("/cloud", HTTP_GET, [](AsyncWebServerRequest *request) {
         request->send(200, "application/json", cloudsyncStatus());
     });
@@ -1003,6 +1045,21 @@ void init_web() {
     });
 
 #endif
+
+    // the fish-tags UI, built into the firmware; upstream's is at /oepl/
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (request->header("If-None-Match") == FISHTAGS_UI_ETAG) {
+            request->send(304);
+            return;
+        }
+        AsyncWebServerResponse *response = request->beginResponse(200, "text/html", FISHTAGS_UI_GZ, FISHTAGS_UI_LEN);
+        response->addHeader("Content-Encoding", "gzip");
+        response->addHeader("Cache-Control", "no-cache");
+        response->addHeader("ETag", FISHTAGS_UI_ETAG);
+        request->send(response);
+    });
+    server.on("/oepl", HTTP_GET, [](AsyncWebServerRequest *request) { request->redirect("/oepl/"); });
+    server.addRewrite(new OeplRewrite());
 
     server.onNotFound([](AsyncWebServerRequest *request) {
         if (request->url() == "/" || request->url() == "index.htm") {

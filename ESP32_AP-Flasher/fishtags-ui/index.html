@@ -1,0 +1,444 @@
+<!doctype html>
+<!--
+  The fish-tags AP page, served at / from the firmware (fishtags_ui.py gzips it into firmware.bin).
+  One file, no dependencies: the AP may have no internet while it is being set up.
+  Reads /cloud, /sysinfo, /get_db and /get_wifi_config, and listens on /ws for tag check-ins.
+  The upstream OpenEPaperLink UI is at /oepl/.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>fish-tags AP</title>
+<style>
+:root{--bg:#f4f4f2;--fg:#111;--card:#fff;--mute:#777;--line:#ddd;--red:#d00;--yel:#e8b400;--grn:#1a8f3c;--hi:#fff6c2}
+@media (prefers-color-scheme:dark){:root{--bg:#161616;--fg:#eee;--card:#222;--mute:#999;--line:#333;--hi:#3a3410}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,sans-serif}
+header{display:flex;gap:12px;align-items:baseline;padding:12px 16px;border-bottom:1px solid var(--line)}
+header h1{font-size:18px;margin:0}header a{flex:none}
+header .host{color:var(--mute);font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+a{color:inherit}
+main{padding:16px;max-width:760px;margin:auto;display:grid;gap:14px}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+h2{font-size:15px;margin:0 0 10px;display:flex;gap:8px;align-items:center}
+h2 .n{color:var(--mute);font-weight:normal}
+.mute{color:var(--mute)}.small{font-size:13px}.err{color:var(--red)}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--mute);display:inline-block;flex:none}
+.dot.ok{background:var(--grn)}.dot.wait{background:var(--yel)}.dot.bad{background:var(--red)}
+.status{display:flex;gap:8px;align-items:center;font-weight:600}
+.claim{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-top:12px}
+.claim>div{flex:1;min-width:220px}
+.claim img{width:168px;height:168px;border-radius:6px;background:#fff;image-rendering:pixelated}
+.code{font:700 28px/1.2 ui-monospace,monospace;letter-spacing:2px}
+dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;margin:10px 0 0;font-size:14px}
+dt{color:var(--mute)}dd{margin:0;overflow-wrap:anywhere}
+code,.mono{font-family:ui-monospace,monospace;font-size:13px}
+.tags{display:grid}
+.tag{display:grid;grid-template-columns:1fr auto;gap:2px 10px;padding:8px 6px;border-top:1px solid var(--line);transition:background 1.5s}
+.tag:first-child{border-top:0}
+.tag.flash{background:var(--hi);transition:none}
+.tag .name{font-weight:600}.tag .name.none{color:var(--mute);font-weight:normal}
+.tag .seen{text-align:right;font-size:13px;color:var(--mute)}
+.tag .facts{grid-column:1/-1;display:flex;gap:4px 12px;flex-wrap:wrap;font-size:13px;color:var(--mute)}
+.chip{padding:0 6px;border-radius:4px;font-size:12px;border:1px solid var(--line);color:var(--fg)}
+.chip.press{background:var(--yel);border-color:var(--yel);color:#000}
+.chip.low{background:var(--red);border-color:var(--red);color:#fff}
+.row{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}
+button,.btn{font:inherit;padding:7px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);cursor:pointer;text-decoration:none}
+.go{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+button:disabled{opacity:.5;cursor:default}
+label{display:block;margin:10px 0 2px;font-size:14px}
+input,select{font:inherit;padding:7px;width:100%;max-width:360px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg)}
+details summary{cursor:pointer}
+pre{background:var(--bg);border-radius:6px;padding:8px;margin:10px 0 0;font-size:12px;max-height:180px;overflow:auto;white-space:pre-wrap}
+footer{text-align:center;padding:8px 16px 24px;font-size:13px;color:var(--mute)}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<header><h1>fish-tags</h1><span class="host" id="host"></span><a class="small" id="cloudlink" href="https://fishtags.net" target="_blank" rel="noopener">fishtags.net ↗</a></header>
+<main>
+  <section id="cloud">
+    <h2>Cloud</h2>
+    <div class="status"><span class="dot" id="c-dot"></span><span id="c-state">Loading…</span></div>
+    <div class="claim" id="c-claim" hidden>
+      <img id="c-qr" alt="QR code for the claim link">
+      <div>
+        <div class="mute small">Claim code</div>
+        <div class="code" id="c-code"></div>
+        <p class="small">Scan the code, or sign in at <span id="c-site"></span>, open Access points and enter it.</p>
+        <a class="btn go" id="c-link" target="_blank" rel="noopener">Claim this AP</a>
+      </div>
+    </div>
+    <dl id="c-facts"></dl>
+  </section>
+
+  <section>
+    <h2>Tags <span class="n" id="t-count"></span></h2>
+    <p class="mute small" id="t-empty">No tags have checked in yet.</p>
+    <div class="tags" id="tags"></div>
+  </section>
+
+  <section>
+    <h2>Access point</h2>
+    <dl id="ap-facts"></dl>
+    <div class="row">
+      <button id="fw-check">Check for update</button>
+      <button class="go" id="fw-go" hidden></button>
+      <button id="reboot">Reboot</button>
+      <span class="small mute" id="fw-msg"></span>
+    </div>
+    <pre id="fw-log" hidden></pre>
+  </section>
+
+  <section>
+    <details id="wifi">
+      <summary><b>Wi-Fi</b> <span class="mute small" id="w-current"></span></summary>
+      <form id="w-form">
+        <label for="w-ssid">Network</label>
+        <input id="w-ssid" list="w-list" required autocomplete="off">
+        <datalist id="w-list"></datalist>
+        <label for="w-pw">Password</label>
+        <input id="w-pw" type="password" autocomplete="off">
+        <details class="small" style="margin-top:10px"><summary>Static IP (leave empty for DHCP)</summary>
+          <label for="w-ip">IP address</label><input id="w-ip" inputmode="decimal">
+          <label for="w-mask">Netmask</label><input id="w-mask" inputmode="decimal">
+          <label for="w-gw">Gateway</label><input id="w-gw" inputmode="decimal">
+          <label for="w-dns">DNS</label><input id="w-dns" inputmode="decimal">
+        </details>
+        <div class="row"><button class="go">Save and reconnect</button><span class="small" id="w-msg"></span></div>
+      </form>
+    </details>
+  </section>
+</main>
+<footer>Everything else is in <a href="/oepl/">the OpenEPaperLink interface</a>.</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const PRESS = { 3: "NFC", 4: "button", 5: "button 2", 6: "button 3" };
+const LOW_BATT_MV = 2600;
+
+const state = { cloud: null, sys: null, info: null, wifi: null, tags: new Map(), skew: 0, ota: false };
+
+// ------------------------------------------------------------------ helpers
+
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === false || v == null) continue;
+    if (k === "class") e.className = v; else e.setAttribute(k, v);
+  }
+  for (const k of kids.flat()) if (k != null && k !== false) e.append(k);
+  return e;
+}
+
+// AP clock, which tag times use: corrected by what the AP last reported
+const now = () => Date.now() / 1000 + state.skew;
+
+function ago(t) {
+  if (!t) return "never";
+  const s = Math.round(now() - t);
+  if (s < 0) return "in " + span(-s);
+  return s < 5 ? "just now" : span(s) + " ago";
+}
+
+function span(s) {
+  if (s < 60) return s + " s";
+  if (s < 3600) return Math.round(s / 60) + " min";
+  if (s < 86400) return Math.round(s / 3600) + " h";
+  return Math.round(s / 86400) + " d";
+}
+
+function facts(dl, rows) {
+  dl.replaceChildren(...rows.filter((r) => r && r[1] != null && r[1] !== "").flatMap(([k, v]) => [el("dt", {}, k), el("dd", {}, v)]));
+}
+
+async function getJson(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(url + ": HTTP " + r.status);
+  return r.json();
+}
+
+function post(url, body) {
+  return fetch(url, { method: "POST", body: body instanceof URLSearchParams ? body : new URLSearchParams(body || {}) });
+}
+
+// ------------------------------------------------------------------ cloud
+
+async function loadCloud() {
+  try {
+    state.cloud = await getJson("/cloud");
+  } catch (e) {
+    state.cloud = { state: "AP not answering" };
+  }
+  drawCloud();
+}
+
+function drawCloud() {
+  const c = state.cloud;
+  const site = (c.url || "https://fishtags.net").replace(/^https?:\/\//, "");
+  $("cloudlink").href = c.url || "https://fishtags.net";
+  $("cloudlink").textContent = site + " ↗";
+
+  let dot = "bad", text = "Cloud: " + c.state;
+  if (c.state === "ok") { dot = "ok"; text = "Connected to " + site; }
+  else if (c.state === "unclaimed") { dot = "wait"; text = "Waiting to be claimed"; }
+  else if (c.state === "registering" || c.state === "starting") { dot = ""; text = "Registering with " + site + "…"; }
+  else if (/^(manifest|events) http/.test(c.state)) text = "Can't reach " + site + " (" + c.state + ")";
+  if (state.wifi && !state.wifi.ssid) { dot = ""; text = "Not on Wi-Fi yet: set it up below"; }
+  $("c-dot").className = "dot " + dot;
+  $("c-state").textContent = text;
+
+  const claiming = !!c.claim_code;
+  $("c-claim").hidden = !claiming;
+  if (claiming) {
+    const link = c.url + "/aps?code=" + c.claim_code;
+    $("c-code").textContent = c.claim_code;
+    $("c-site").textContent = site;
+    $("c-link").href = link;
+    // the QR only changes with the code
+    if ($("c-qr").dataset.code !== c.claim_code) {
+      $("c-qr").dataset.code = c.claim_code;
+      $("c-qr").src = "/cloud_qr.svg?c=" + encodeURIComponent(c.claim_code);
+    }
+  }
+
+  facts($("c-facts"), [
+    ["Last contact", c.last_contact ? ago(c.last_contact) : c.state === "ok" ? "" : "never"],
+    ["Checks every", c.poll_s ? c.poll_s + " s" : ""],
+    ["Waiting to send", c.queued ? c.queued + " check-ins" : ""],
+    ["Lost", c.dropped ? c.dropped + " check-ins since boot (cloud unreachable)" : ""],
+    ["AP id", c.ap ? el("code", {}, c.ap) : ""],
+  ]);
+}
+
+// ------------------------------------------------------------------ tags
+
+async function loadTags() {
+  let pos = 0;
+  for (;;) {
+    const page = await getJson("/get_db?pos=" + pos);
+    for (const t of page.tags || []) state.tags.set(t.mac, t);
+    if (!page.continu) break;
+    pos = page.continu;
+  }
+  drawTags();
+}
+
+const pressedRecently = (t) => PRESS[t.wakeupReason] && now() - t.lastseen < 120;
+
+function tagSort(a, b) {
+  // a tag just pressed first, which finds the one in your hand; then named (cloud-managed) tags by
+  // tank, the rest by MAC
+  if (pressedRecently(a) !== pressedRecently(b)) return pressedRecently(a) ? -1 : 1;
+  if (pressedRecently(a)) return b.lastseen - a.lastseen;
+  if (!!a.alias !== !!b.alias) return a.alias ? -1 : 1;
+  return (a.alias || "").localeCompare(b.alias || "", undefined, { numeric: true }) || a.mac.localeCompare(b.mac);
+}
+
+function tagRow(t) {
+  const pressed = pressedRecently(t);
+  const batt = t.batteryMv ? (t.batteryMv / 1000).toFixed(2) + " V" : null;
+  const cloud = t.contentMode === 30;
+  return el("div", { class: "tag", id: "tag-" + t.mac },
+    el("div", {},
+      el("span", { class: "name" + (t.alias ? "" : " none") }, t.alias || "Not linked"), " ",
+      el("span", { class: "mono mute" }, t.mac)),
+    el("div", { class: "seen", title: t.lastseen ? new Date(t.lastseen * 1000).toLocaleString() : "" }, ago(t.lastseen)),
+    el("div", { class: "facts" },
+      pressed && el("span", { class: "chip press" }, "pressed: " + PRESS[t.wakeupReason]),
+      batt && el("span", { class: "chip" + (t.batteryMv < LOW_BATT_MV ? " low" : "") }, batt),
+      t.RSSI ? el("span", {}, "RSSI " + t.RSSI) : null,
+      t.temperature ? el("span", {}, t.temperature + " °C") : null,
+      t.nextcheckin > now() ? el("span", {}, "next check-in " + ago(t.nextcheckin)) : null,
+      t.pending ? el("span", {}, t.pending + " update waiting") : null,
+      el("span", {}, cloud ? "drawn by the cloud" : "not managed by fish-tags"),
+    ));
+}
+
+function drawTags() {
+  // hwType 0xE0 and up is the AP's own screen
+  const list = [...state.tags.values()].filter((t) => t.hwType < 0xe0).sort(tagSort);
+  $("t-count").textContent = list.length ? "(" + list.length + ")" : "";
+  $("t-empty").hidden = list.length > 0;
+  $("tags").replaceChildren(...list.map(tagRow));
+}
+
+function tagUpdate(t) {
+  const before = state.tags.get(t.mac);
+  state.tags.set(t.mac, t);
+  drawTags();
+  if (before && before.lastseen !== t.lastseen) {
+    const row = $("tag-" + t.mac);
+    if (row) { row.classList.add("flash"); requestAnimationFrame(() => requestAnimationFrame(() => row.classList.remove("flash"))); }
+  }
+}
+
+// ------------------------------------------------------------------ access point
+
+async function loadInfo() {
+  try { state.info = await getJson("/sysinfo"); } catch (e) { return; }
+  if (state.info.currtime) state.skew = state.info.currtime - Date.now() / 1000;
+  $("host").textContent = state.info.alias || location.host;
+  drawAp();
+}
+
+function drawAp() {
+  const i = state.info || {}, s = state.sys || {};
+  const built = Number(i.buildtime) ? new Date(i.buildtime * 1000).toLocaleDateString() : "";
+  const fw = i.sha && i.sha !== "0" ? i.sha : i.buildversion;
+  facts($("ap-facts"), [
+    ["Wi-Fi", s.wifissid ? s.wifissid + (s.rssi ? " (" + s.rssi + " dBm)" : "") : ""],
+    ["Address", location.host],
+    ["Up", s.uptime ? span(s.uptime) : ""],
+    ["Free memory", s.heap ? Math.round(s.heap / 1024) + " KB" : ""],
+    ["Firmware", fw ? fw + (built ? ", built " + built : "") : ""],
+    ["Radio", i.ap_typename ? i.ap_typename + ", channel " + i.channel : ""],
+    ["Clock", i.currtime ? new Date(now() * 1000).toLocaleString() : ""],
+  ]);
+}
+
+// firmware: the cloud publishes the newest build as {url}/v1/fw/latest.json
+let latest = null;
+async function checkFirmware() {
+  const base = (state.cloud && state.cloud.url) || "https://fishtags.net";
+  $("fw-msg").textContent = "Checking…";
+  $("fw-go").hidden = true;
+  try {
+    latest = await getJson(base + "/v1/fw/latest.json");
+  } catch (e) {
+    $("fw-msg").textContent = "Couldn't reach " + base.replace(/^https?:\/\//, "") + " from this browser.";
+    return;
+  }
+  const mine = state.info && state.info.sha;
+  if (mine && latest.sha && latest.sha.startsWith(mine)) {
+    $("fw-msg").textContent = "Up to date (" + mine + ").";
+    return;
+  }
+  $("fw-msg").textContent = "";
+  $("fw-go").textContent = "Install " + latest.sha;
+  $("fw-go").hidden = false;
+}
+
+async function installFirmware() {
+  if (!latest || !confirm("Install firmware " + latest.sha + "? The AP restarts when it is done.")) return;
+  const base = (state.cloud && state.cloud.url) || "https://fishtags.net";
+  state.ota = true;
+  $("fw-go").disabled = $("fw-check").disabled = true;
+  $("fw-log").hidden = false;
+  $("fw-log").textContent = "";
+  $("fw-msg").textContent = "Installing; don't power off the AP.";
+  const r = await post("/update_ota", { url: base + "/v1/fw/" + latest.name, md5: latest.md5, size: latest.size });
+  if (!r.ok) { $("fw-msg").textContent = "The AP refused: HTTP " + r.status; state.ota = false; }
+}
+
+function otaLine(text) {
+  const log = $("fw-log");
+  if (text === "[reboot]") {
+    log.textContent += "Restarting…\n";
+    $("fw-msg").textContent = "Restarting; this page reconnects by itself.";
+    post("/reboot");
+    return;
+  }
+  // progress lines replace each other
+  const lines = log.textContent.split("\n").filter((l) => l && !(text.startsWith("Progress") && l.startsWith("Progress")));
+  log.textContent = [...lines, text].join("\n") + "\n";
+  log.scrollTop = log.scrollHeight;
+}
+
+async function reboot() {
+  if (!confirm("Restart the AP? Tags keep their images; it is back in about 20 seconds.")) return;
+  await post("/reboot");
+  $("fw-msg").textContent = "Restarting…";
+}
+
+// ------------------------------------------------------------------ wi-fi
+
+async function loadWifi() {
+  let w;
+  try { w = await getJson("/get_wifi_config"); } catch (e) { return; }
+  state.wifi = w;
+  if (state.cloud) drawCloud();
+  $("w-current").textContent = w.ssid ? w.ssid : "not set up";
+  $("w-ssid").value = w.ssid || "";
+  for (const k of ["ip", "mask", "gw", "dns"]) $("w-" + k).value = w[k] || "";
+  // no network yet: this is the setup page
+  if (!w.ssid) $("wifi").open = true;
+  if ($("wifi").open) scanWifi();
+}
+
+async function scanWifi() {
+  // the AP scans in the background; ask until it has results
+  for (let i = 0; i < 10 && $("wifi").open; i++) {
+    let r;
+    try { r = await getJson("/get_ssid_list"); } catch (e) { return; }
+    if (r.networks && r.networks.length) {
+      const seen = new Set();
+      $("w-list").replaceChildren(...r.networks.sort((a, b) => b.rssi - a.rssi)
+        .filter((n) => !seen.has(n.ssid) && seen.add(n.ssid))
+        .map((n) => el("option", { value: n.ssid }, n.rssi + " dBm")));
+      return;
+    }
+    await new Promise((res) => setTimeout(res, 2000));
+  }
+}
+
+async function saveWifi(ev) {
+  ev.preventDefault();
+  const data = { ssid: $("w-ssid").value.trim(), pw: $("w-pw").value };
+  for (const k of ["ip", "mask", "gw", "dns"]) data[k] = $("w-" + k).value.trim();
+  if (data.ssid === "factory") return;  // that SSID factory-resets the AP; not from this page
+  const r = await fetch("/save_wifi_config", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(data) });
+  // DHCP: the router names it OpenEpaperLink-XXXX
+  const where = data.ip ? "Then open http://" + data.ip + "/." : "Its new address is in your router's client list, as OpenEpaperLink-….";
+  $("w-msg").textContent = r.ok ? "Saved. The AP restarts and joins " + data.ssid + ". " + where : "Not saved: HTTP " + r.status;
+}
+
+// ------------------------------------------------------------------ live updates
+
+function connect() {
+  const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.onmessage = (ev) => {
+    let m;
+    try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.tags) for (const t of m.tags) tagUpdate(t);
+    if (m.sys) {
+      state.sys = Object.assign(state.sys || {}, m.sys);
+      if (m.sys.currtime) state.skew = m.sys.currtime - Date.now() / 1000;
+      drawAp();
+    }
+    if (m.console && state.ota) otaLine(m.console);
+    if (m.logMsg && m.logMsg.startsWith("cloud:")) loadCloud();
+  };
+  ws.onclose = () => setTimeout(state.ota ? waitForRestart : connect, 3000);
+}
+
+// after a firmware update, reload once the AP answers again: the page itself may have changed
+async function waitForRestart() {
+  try {
+    await getJson("/sysinfo");
+    location.reload();
+  } catch (e) {
+    setTimeout(waitForRestart, 2000);
+  }
+}
+
+$("fw-check").onclick = checkFirmware;
+$("fw-go").onclick = installFirmware;
+$("reboot").onclick = reboot;
+$("w-form").onsubmit = saveWifi;
+$("wifi").addEventListener("toggle", () => $("wifi").open && scanWifi());
+
+loadCloud();
+loadInfo();
+loadTags().catch(() => {});
+loadWifi();
+connect();
+setInterval(loadCloud, 5000);
+// relative times
+setInterval(() => { drawTags(); drawAp(); }, 15000);
+</script>
+</body>
+</html>
