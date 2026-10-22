@@ -1,4 +1,6 @@
 #include "web.h"
+
+#include "cloudsync.h"
 #include "tlsr_flasher.h"
 
 #include <Arduino.h>
@@ -905,6 +907,9 @@ void init_web() {
     // OTA related calls
 
     server.on("/sysinfo", HTTP_GET, handleSysinfoRequest);
+    server.on("/cloud", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "application/json", cloudsyncStatus());
+    });
     // core dump of the last crash, for: espcoredump.py info_corefile -t raw -c coredump.bin firmware.elf
     server.on("/coredump", HTTP_GET, [](AsyncWebServerRequest *request) {
         const size_t size = coreDumpSize();

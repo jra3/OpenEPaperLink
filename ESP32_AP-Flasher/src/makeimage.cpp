@@ -71,10 +71,50 @@ static void setupJpgDecoder() {
     TJpgDec.setCallback(spr_output);
 }
 
+/// @brief Convert an .fti image, the cloud's palette format: "FTI1", u16 w, u16 h (little endian),
+/// u8 n, n RGB triples, then one 2-bit palette index per pixel, row-major, high bits first
+static void fti2buffer(const String &filein, String &fileout, imgParam &imageParams) {
+    xSemaphoreTake(fsMutex, portMAX_DELAY);
+    fs::File f = contentFS->open(filein, "r");
+    const size_t len = f ? f.size() : 0;
+    uint8_t *data = len ? (uint8_t *)malloc(len) : nullptr;
+    const bool read = data && f.read(data, len) == len;
+    if (f) f.close();
+    xSemaphoreGive(fsMutex);
+
+    uint16_t w = 0, h = 0;
+    uint8_t n = 0;
+    if (read && len >= 9 && memcmp(data, "FTI1", 4) == 0) {
+        memcpy(&w, data + 4, 2);
+        memcpy(&h, data + 6, 2);
+        n = data[8];
+    }
+    const size_t pixels = 9 + n * 3;
+    if (n == 0 || n > 4 || len < pixels + ((size_t)w * h + 3) / 4) {
+        wsErr("invalid fti " + filein);
+        w = h = 0;
+    }
+    if (w && h) {
+        uint16_t colors[4];
+        for (uint8_t i = 0; i < n; i++) colors[i] = tft.color565(data[9 + i * 3], data[10 + i * 3], data[11 + i * 3]);
+        jpg2buffer(w, h, [&]() {
+            for (uint32_t i = 0; i < (uint32_t)w * h; i++) {
+                const uint8_t idx = (data[pixels + i / 4] >> (6 - 2 * (i % 4))) & 3;
+                spr.drawPixel(i % w, i / w, colors[idx < n ? idx : 0]);
+            }
+        }, fileout, imageParams);
+    }
+    free(data);
+}
+
 void jpg2buffer(String filein, String fileout, imgParam &imageParams) {
     setupJpgDecoder();
     if (filein.c_str()[0] != '/') {
         filein = "/" + filein;
+    }
+    if (filein.endsWith(".fti")) {
+        fti2buffer(filein, fileout, imageParams);
+        return;
     }
     uint16_t w = 0, h = 0;
     TJpgDec.getFsJpgSize(&w, &h, filein, *contentFS);

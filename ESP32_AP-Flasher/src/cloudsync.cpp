@@ -9,6 +9,10 @@
 //
 // Events: POST {url}/v1/ap/{ap}/events {"events":[...]}; the reply carries the
 // manifest when it changed.
+//
+// Claiming: an AP without a token registers with POST {url}/v1/claim and saves the token it gets.
+// The cloud answers 403 with a claim code until someone enters that code in the web app; the code
+// is shown at GET /cloud on the AP.
 
 #include "cloudsync.h"
 
@@ -29,6 +33,7 @@ struct CloudEvent {
     uint8_t mac[8];
     uint32_t t;
     uint8_t reason;
+    uint16_t hwType;
     uint16_t batteryMv;
     int8_t temperature;
     int8_t rssi;
@@ -39,6 +44,21 @@ static QueueHandle_t eventQueue = xQueueCreate(64, sizeof(CloudEvent));
 
 static constexpr uint32_t EVENT_FLUSH_MS = 30000;  // check-ins wait at most this long; presses go at once
 static constexpr uint32_t RETRY_MS = 30000;
+static constexpr uint32_t UNCLAIMED_POLL_S = 10;
+static const char* DEFAULT_URL = "https://fish-tags.steep-sea-d584.workers.dev";
+
+// for GET /cloud, which the web server reads from its own task
+static SemaphoreHandle_t statusMutex = xSemaphoreCreateMutex();
+static String cloudState = "starting";
+static String cloudClaimCode;
+static String cloudApId;
+
+template <typename F>
+static void withStatus(F f) {
+    xSemaphoreTake(statusMutex, portMAX_DELAY);
+    f();
+    xSemaphoreGive(statusMutex);
+}
 
 struct CloudConfig {
     String url;
@@ -56,6 +76,7 @@ void cloudsyncEvent(const uint8_t mac[8], const struct AvailDataReq& adr, uint32
     memcpy(e.mac, mac, 8);
     e.t = now;
     e.reason = adr.wakeupReason;
+    e.hwType = adr.hwType;
     e.batteryMv = adr.batteryMv;
     e.temperature = adr.temperature;
     e.rssi = adr.lastPacketRSSI;
@@ -68,25 +89,75 @@ void cloudsyncEvent(const uint8_t mac[8], const struct AvailDataReq& adr, uint32
     }
 }
 
-static bool loadConfig(CloudConfig& cfg) {
+String cloudsyncStatus() {
     JsonDocument doc;
-    {
-        xSemaphoreTake(fsMutex, portMAX_DELAY);
-        fs::File f = contentFS->open("/cloud.json", "r");
-        if (!f) {
-            xSemaphoreGive(fsMutex);
-            return false;
-        }
-        const DeserializationError err = deserializeJson(doc, f);
+    withStatus([&] {
+        doc["state"] = cloudState;
+        doc["ap"] = cloudApId;
+        if (cloudClaimCode.length()) doc["claim_code"] = cloudClaimCode;
+    });
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
+// /cloud.json: {"url":..., "ap":..., "token":...}. Missing or partial means "register with url".
+static void loadConfig(CloudConfig& cfg) {
+    JsonDocument doc;
+    xSemaphoreTake(fsMutex, portMAX_DELAY);
+    fs::File f = contentFS->open("/cloud.json", "r");
+    if (f) {
+        deserializeJson(doc, f);
         f.close();
-        xSemaphoreGive(fsMutex);
-        if (err) return false;
     }
-    cfg.url = doc["url"].as<String>();
+    xSemaphoreGive(fsMutex);
+    cfg.url = doc["url"].is<String>() ? doc["url"].as<String>() : String(DEFAULT_URL);
     cfg.ap = doc["ap"].as<String>();
     cfg.token = doc["token"].as<String>();
     while (cfg.url.endsWith("/")) cfg.url.remove(cfg.url.length() - 1);
-    return cfg.url.startsWith("https://") && cfg.ap.length() && cfg.token.length();
+    if (cfg.ap == "null") cfg.ap = "";
+    if (cfg.token == "null") cfg.token = "";
+}
+
+static bool saveConfig(const CloudConfig& cfg) {
+    JsonDocument doc;
+    doc["url"] = cfg.url;
+    doc["ap"] = cfg.ap;
+    doc["token"] = cfg.token;
+    LockedFile f("/cloud.json", "w");
+    return f && serializeJson(doc, f) > 0;
+}
+
+// POST /v1/claim: get an id and token; the cloud holds them until the claim code is entered
+static bool registerAp(WiFiClientSecure& client, CloudConfig& cfg) {
+    HTTPClient http;
+    http.begin(client, cfg.url + "/v1/claim");
+    http.setTimeout(10000);
+    const int code = http.POST("");
+    bool ok = false;
+    if (code == 200) {
+        JsonDocument doc;
+        if (!deserializeJson(doc, http.getString())) {
+            cfg.ap = doc["ap"].as<String>();
+            cfg.token = doc["token"].as<String>();
+            withStatus([&] { cloudClaimCode = doc["claim_code"].as<String>(); });
+            ok = cfg.ap.length() && cfg.token.length() && saveConfig(cfg);
+        }
+    }
+    http.end();
+    if (ok) wsLog("cloud: registered as " + cfg.ap + ", claim code " + cloudClaimCode);
+    else logLineRateLimited("cloudclaim", "cloud: register http " + String(code), 600);
+    return ok;
+}
+
+// a 403 carries the claim code while nobody has claimed this AP
+static void noteUnclaimed(const String& body) {
+    JsonDocument doc;
+    if (deserializeJson(doc, body) || !doc["claim_code"].is<String>()) return;
+    const String code = doc["claim_code"].as<String>();
+    if (code != cloudClaimCode) wsLog("cloud: waiting to be claimed, code " + code);
+    withStatus([&] { cloudClaimCode = code; });
+    withStatus([&] { cloudState = "unclaimed"; });
 }
 
 static void beginRequest(HTTPClient& http, WiFiClientSecure& client, const CloudConfig& cfg, const String& path) {
@@ -201,6 +272,7 @@ static int postEvents(WiFiClientSecure& client, const CloudConfig& cfg, std::vec
         o["mac"] = hexmac;
         o["t"] = e.t;
         o["reason"] = e.reason;
+        o["hw"] = e.hwType;
         o["batt"] = e.batteryMv;
         o["temp"] = e.temperature;
         o["rssi"] = e.rssi;
@@ -219,6 +291,8 @@ static int postEvents(WiFiClientSecure& client, const CloudConfig& cfg, std::vec
     if (code == 200) {
         deserializeJson(reply, http.getString());
         if (reply["manifest"].is<JsonObject>()) etag = http.header("ETag");
+    } else if (code == 403) {
+        noteUnclaimed(http.getString());
     }
     http.end();
     return code;
@@ -232,6 +306,7 @@ static int getManifest(WiFiClientSecure& client, const CloudConfig& cfg, String&
     http.collectHeaders(keys, 1);
     const int code = http.GET();
     if (code == 200 && !deserializeJson(manifest, http.getString())) etag = http.header("ETag");
+    if (code == 403) noteUnclaimed(http.getString());
     http.end();
     return code;
 }
@@ -254,8 +329,16 @@ void cloudsyncTask(void* parameter) {
     while (true) {
         vTaskDelay(1000 / portTICK_PERIOD_MS);
         if (config.runStatus == RUNSTATUS_STOP || WiFi.status() != WL_CONNECTED) continue;
-        if (!loadConfig(cfg)) {
+        loadConfig(cfg);
+        withStatus([&] { cloudApId = cfg.ap; });
+        if (!cfg.url.startsWith("https://")) {
+            withStatus([&] { cloudState = "bad url in /cloud.json"; });
             vTaskDelay(30000 / portTICK_PERIOD_MS);
+            continue;
+        }
+        if (!cfg.ap.length() || !cfg.token.length()) {
+            withStatus([&] { cloudState = "registering"; });
+            if (!registerAp(client, cfg)) vTaskDelay(RETRY_MS / portTICK_PERIOD_MS);
             continue;
         }
 
@@ -273,20 +356,31 @@ void cloudsyncTask(void* parameter) {
             JsonDocument reply;
             const int code = postEvents(client, cfg, batch, etag, reply);
             if (code == 200) {
+                withStatus([&] { cloudState = "ok"; });
+                withStatus([&] { cloudClaimCode = ""; });
                 batch.clear();
                 if (reply["manifest"].is<JsonObject>()) {
                     manifest.set(reply["manifest"]);
                     haveManifest = true;
                 }
+            } else if (code == 403) {
+                batch.clear();  // nobody to log them for yet
             } else {
+                withStatus([&] { cloudState = "events http " + String(code); });
                 logLineRateLimited("cloudevents", "cloud: events http " + String(code), 600);
                 nextFlush = millis() + RETRY_MS;
             }
         } else if ((int32_t)(millis() - nextPoll) >= 0) {
             const int code = getManifest(client, cfg, etag, manifest);
             haveManifest = code == 200;
-            if (code != 200 && code != 304) logLineRateLimited("cloudmanifest", "cloud: manifest http " + String(code), 600);
-            nextPoll = millis() + pollSeconds * 1000;
+            if (code == 200 || code == 304) {
+                withStatus([&] { cloudState = "ok"; });
+                withStatus([&] { cloudClaimCode = ""; });
+            } else if (code != 403) {
+                withStatus([&] { cloudState = "manifest http " + String(code); });
+                logLineRateLimited("cloudmanifest", "cloud: manifest http " + String(code), 600);
+            }
+            nextPoll = millis() + (code == 403 ? UNCLAIMED_POLL_S : pollSeconds) * 1000;
         }
 
         if (haveManifest && !applyManifest(client, cfg, manifest.as<JsonObject>(), pollSeconds)) {
