@@ -47,7 +47,7 @@ static QueueHandle_t eventQueue = xQueueCreate(64, sizeof(CloudEvent));
 static constexpr uint32_t EVENT_FLUSH_MS = 30000;  // check-ins wait at most this long; presses go at once
 static constexpr uint32_t RETRY_MS = 30000;
 static constexpr uint32_t UNCLAIMED_POLL_S = 10;
-static const char* DEFAULT_URL = "https://tags.tinybubbl.es";
+static const char* DEFAULT_URL = "https://fishtags.net";
 
 // for GET /cloud, which the web server reads from its own task
 static SemaphoreHandle_t statusMutex = xSemaphoreCreateMutex();
