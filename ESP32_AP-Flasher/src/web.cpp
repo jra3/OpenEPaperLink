@@ -40,6 +40,13 @@
 #include "webflasher.h"
 #endif
 
+// A tag in CONTENTMODE_CLOUD is drawn by the cloud; its settings and image are not edited here.
+static bool cloudManaged(const uint8_t mac[8]) {
+    TagDBLock lock;
+    const tagRecord *taginfo = tagRecord::findByMAC(mac);
+    return taginfo != nullptr && taginfo->contentMode == CONTENTMODE_CLOUD;
+}
+
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
@@ -399,6 +406,10 @@ void init_web() {
         if (request->hasParam("mac", true)) {
             String dst = request->getParam("mac", true)->value();
             uint8_t mac[8];
+            if (hex2mac(dst, mac) && cloudManaged(mac)) {
+                request->send(403, "text/plain", "This tag is managed by fish-tags: change it in the app");
+                return;
+            }
             if (hex2mac(dst, mac)) {
                 tagRecord *taginfo = tagRecord::findByMAC(mac);
                 if (taginfo != nullptr) {
@@ -682,7 +693,6 @@ void init_web() {
             aliasValue.toCharArray(config.alias, aliasLength + 1);
             config.alias[aliasLength] = '\0';
         }
-
 
         if (request->hasParam("channel", true)) {
             config.channel = static_cast<uint8_t>(request->getParam("channel", true)->value().toInt());
@@ -1082,6 +1092,10 @@ void doImageUpload(AsyncWebServerRequest *request, String filename, size_t index
             request->send(400, "text/plain", "parameters incomplete");
             return;
         }
+        if (cloudManaged(mac)) {
+            request->send(403, "text/plain", "This tag is managed by fish-tags");
+            return;
+        }
         const size_t size = request->contentLength();
         if (size == 0) {
             request->send(411, "text/plain", "Content-Length required");
@@ -1196,6 +1210,10 @@ void doJsonUpload(AsyncWebServerRequest *request) {
     if (request->hasParam("mac", true) && request->hasParam("json", true)) {
         String dst = request->getParam("mac", true)->value();
         uint8_t mac[8];
+        if (hex2mac(dst, mac) && cloudManaged(mac)) {
+            request->send(403, "text/plain", "This tag is managed by fish-tags");
+            return;
+        }
         if (hex2mac(dst, mac)) {
             xSemaphoreTake(fsMutex, portMAX_DELAY);
             File file = contentFS->open("/current/" + dst + ".json", "w");

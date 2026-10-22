@@ -5,7 +5,9 @@
 //   {"v":1,"poll_s":60,"tags":{"<MAC>":{"img":"img/<hash>.jpg","wake_s":600}}}
 // Images are immutable and named by content hash. A tag that is not in the
 // manifest is left alone. A tag in it is put in CONTENTMODE_CLOUD with
-// {"filename":"/cloud/<hash>.jpg"}, which drawNew converts as a static image.
+// {"filename":"/cloud/<hash>.fti"}, which drawNew converts as a static image, and
+// takes the manifest's "name" (its tank) as its alias. The AP's web UI cannot
+// change such a tag.
 //
 // Events: POST {url}/v1/ap/{ap}/events {"events":[...]}; the reply carries the
 // manifest when it changed.
@@ -209,6 +211,7 @@ static bool applyManifest(WiFiClientSecure& client, const CloudConfig& cfg, Json
     std::set<String> keep;
     for (JsonPair kv : manifest["tags"].as<JsonObject>()) {
         const String img = kv.value()["img"].as<String>();
+        const String name = kv.value()["name"] | "";
         const String path = localImagePath(img);
         keep.insert(path.substring(7));
 
@@ -225,10 +228,17 @@ static bool applyManifest(WiFiClientSecure& client, const CloudConfig& cfg, Json
         cfgdoc["dither"] = 0;  // the cloud renders in the tag's palette
         String modeConfig;
         serializeJson(cfgdoc, modeConfig);
+        bool current = false, renamed = false;
         {
             TagDBLock lock;
-            if (taginfo->contentMode == CONTENTMODE_CLOUD && taginfo->modeConfigJson == modeConfig) continue;
+            current = taginfo->contentMode == CONTENTMODE_CLOUD && taginfo->modeConfigJson == modeConfig;
+            if (current && taginfo->alias != name) {
+                taginfo->alias = name;
+                renamed = true;
+            }
         }
+        if (renamed) wsSendTaginfo(mac, SYNC_NOSYNC);
+        if (current) continue;
 
         if (!fileExists(path) && !downloadImage(client, cfg, img, path)) {
             complete = false;
@@ -239,6 +249,7 @@ static bool applyManifest(WiFiClientSecure& client, const CloudConfig& cfg, Json
             TagDBLock lock;
             taginfo->contentMode = CONTENTMODE_CLOUD;
             taginfo->modeConfigJson = modeConfig;
+            taginfo->alias = name;
             taginfo->nextupdate = 0;
         }
         wsLog("cloud: " + String(kv.key().c_str()) + " -> " + img);
